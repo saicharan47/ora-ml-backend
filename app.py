@@ -1,6 +1,6 @@
 
 from flask import Flask, request, jsonify
-import joblib
+import xgboost as xgb
 import pandas as pd
 import os
 
@@ -9,10 +9,11 @@ app = Flask(__name__)
 # Load the trained XGBoost model once when the server starts.
 MODEL_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "ora_xgboost_model.joblib"
+    "ora_xgboost_model.json"
 )
 
-model = joblib.load(MODEL_PATH)
+model = xgb.XGBClassifier()
+model.load_model(MODEL_PATH)
 
 # These names and this order must match the model's training features.
 FEATURES = [
