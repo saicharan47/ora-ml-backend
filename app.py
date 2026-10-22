@@ -1,12 +1,16 @@
-from flask import Flask, request, jsonify
-import math
 
-app = Flask(__name__)
+import os
+from pathlib import Path
 
-# ORA experimental range-based anomaly flagger.
-# These broad limits are placeholders for pipeline testing, NOT validated
-# drink-safety limits and NOT evidence that a drug has been detected.
-# Keep feature names aligned with the ESP32/Android payload and existing API.
+import joblib
+import numpy as np
+from flask import Flask, jsonify, request
+
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = Path(
+    os.getenv("ORA_MODEL_PATH", str(BASE_DIR / "ora_model.joblib"))
+)
+
 FEATURES = [
     "nitrogen",
     "phosphorus",
@@ -18,106 +22,163 @@ FEATURES = [
     "turbidity_ntu",
 ]
 
-# Broad global envelopes across the synthetic profiles.
-# Validate units and replace these with ranges derived from measured,
-# calibrated readings before relying on the results.
-BOUNDS = {
-    "nitrogen": (0.0, 20.0),
-    "phosphorus": (0.0, 40.0),
-    "potassium": (0.0, 400.0),
-    "temperature_c": (10.0, 35.0),
-    "ph": (2.0, 8.5),
-    "ec_us_cm": (0.1, 6000.0),
-    "moisture_pct": (96.0, 100.0),
-    "turbidity_ntu": (0.0, 2000.0),
-}
+app = Flask(__name__)
+_model_bundle = None
 
-SAFETY_NOTICE = (
-    "Experimental anomaly flag only. 'Not Spiked' means readings were inside "
-    "the configured broad ranges; it does not prove a drink is safe. Some "
-    "adulterants may not change these sensors, and ordinary beverages or "
-    "sensor errors may trigger an alert. Not validated for real drink safety."
-)
+
+def load_bundle():
+    global _model_bundle
+
+    if _model_bundle is None:
+        if not MODEL_PATH.is_file():
+            raise FileNotFoundError(
+                f"Model file not found: {MODEL_PATH}. "
+                "Run train_model.py first."
+            )
+
+        bundle = joblib.load(MODEL_PATH)
+
+        if not isinstance(bundle, dict) or "model" not in bundle:
+            raise ValueError(
+                "Invalid model bundle. Retrain using the supplied "
+                "train_model.py script."
+            )
+
+        if "features" not in bundle:
+            raise ValueError("Model bundle does not contain feature names.")
+
+        if list(bundle["features"]) != FEATURES:
+            raise ValueError(
+                "Model feature order does not match the API feature order."
+            )
+
+        _model_bundle = bundle
+
+    return _model_bundle
 
 
 @app.get("/")
 def home():
     return jsonify({
-        "service": "ORA Range-Check API",
-        "status": "running",
-        "mode": "range_based_anomaly_flagger",
-        "experimental": True
+        "service": "ORA experimental beverage sensor classifier",
+        "status": "ok",
+        "model_file": MODEL_PATH.name,
+        "model_exists": MODEL_PATH.is_file(),
+        "warning": (
+            "Experimental only. The model uses simulated training data "
+            "and is not validated for real drink safety."
+        ),
+        "predict_endpoint": "/predict",
+        "health_endpoint": "/health",
     })
 
 
 @app.get("/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "model_loaded": True,
-        "mode": "range_based_anomaly_flagger",
-        "experimental": True
-    })
+    try:
+        bundle = load_bundle()
+        return jsonify({
+            "status": "ok",
+            "model_loaded": True,
+            "model_file": MODEL_PATH.name,
+            "features": bundle["features"],
+            "experimental": True,
+        })
+    except Exception as exc:
+        app.logger.exception("Health check failed")
+        return jsonify({
+            "status": "error",
+            "model_loaded": False,
+            "error": str(exc),
+        }), 503
 
 
 @app.post("/predict")
 def predict():
-    data = request.get_json(silent=True)
-
-    if not isinstance(data, dict):
-        return jsonify({"error": "Send sensor readings as JSON."}), 400
-
-    missing = [name for name in FEATURES if name not in data or data[name] is None]
-    if missing:
-        return jsonify({
-            "error": "Missing sensor readings.",
-            "missing_features": missing,
-            "label": "Unable to Assess",
-            "experimental": True,
-            "safety_notice": SAFETY_NOTICE
-        }), 400
-
-    values = {}
     try:
+        payload = request.get_json(silent=True)
+
+        if not isinstance(payload, dict):
+            return jsonify({
+                "error": "Send a JSON object containing all eight sensor fields."
+            }), 400
+
+        missing = [name for name in FEATURES if name not in payload]
+        if missing:
+            return jsonify({
+                "error": "Missing required fields",
+                "missing": missing,
+            }), 400
+
+        values = {}
+
         for name in FEATURES:
-            values[name] = float(data[name])
-    except (TypeError, ValueError):
-        return jsonify({"error": "All readings must be numeric."}), 400
+            try:
+                value = float(payload[name])
+            except (TypeError, ValueError):
+                return jsonify({
+                    "error": f"Field '{name}' must be numeric."
+                }), 400
 
-    if not all(math.isfinite(value) for value in values.values()):
-        return jsonify({"error": "Readings must be finite numbers."}), 400
+            if not np.isfinite(value):
+                return jsonify({
+                    "error": f"Field '{name}' must be finite."
+                }), 400
 
-    out_of_range = []
-    for name in FEATURES:
-        low, high = BOUNDS[name]
-        value = values[name]
-        if value < low or value > high:
-            out_of_range.append({
-                "feature": name,
-                "value": value,
-                "configured_range": {"min": low, "max": high}
-            })
+            values[name] = value
 
-    is_anomaly = bool(out_of_range)
-    prediction = 1 if is_anomaly else 0
+        bundle = load_bundle()
+        model = bundle["model"]
 
-    # Compatibility field only: this is NOT a calibrated probability.
-    # 1.0 means the rule fired; 0.0 means it did not.
-    return jsonify({
-        "prediction": prediction,
-        "label": "Spiked" if is_anomaly else "Not Spiked",
-        "spiked_probability": 1.0 if is_anomaly else 0.0,
-        "score_type": "binary_range_flag_not_probability",
-        "prediction_type": "out_of_range_anomaly_heuristic",
-        "out_of_range_features": out_of_range,
-        "readings": values,
-        "experimental": True,
-        "safety_notice": SAFETY_NOTICE
-    })
+        # Keep the exact feature order used during training.
+        X = np.array(
+            [[values[name] for name in bundle["features"]]],
+            dtype=float,
+        )
+
+        prediction = int(model.predict(X)[0])
+
+        if prediction not in (0, 1):
+            raise ValueError(
+                f"Unexpected model prediction: {prediction}"
+            )
+
+        spiked_probability = None
+
+        if hasattr(model, "predict_proba"):
+            probabilities = model.predict_proba(X)[0]
+            classes = list(model.classes_)
+
+            if 1 in classes:
+                spiked_probability = float(
+                    probabilities[classes.index(1)]
+                )
+
+        return jsonify({
+            "prediction": prediction,
+            "label": "Spiked" if prediction == 1 else "Not Spiked",
+            "spiked_probability": spiked_probability,
+            "prediction_type": "experimental_model_prediction",
+            "model_status": "experimental_simulated_training_data",
+            "safety_notice": (
+                "This is an experimental model output, not a validated "
+                "drug test. The model was trained on simulated readings. "
+                "'Not Spiked' does not prove that a drink is safe. "
+                "Do not use this result to make drink-safety decisions."
+            ),
+            "readings": values,
+        })
+
+    except FileNotFoundError as exc:
+        return jsonify({"error": str(exc)}), 503
+
+    except Exception:
+        app.logger.exception("Prediction failed")
+        return jsonify({
+            "error": "Prediction failed. Check server logs."
+        }), 500
 
 
 if __name__ == "__main__":
-    # Render provides PORT; keep local development supported too.
-    import os
-    port = int(os.environ.get("PORT", "5000"))
+    port = int(os.getenv("PORT", "5000"))
     app.run(host="0.0.0.0", port=port, debug=False)
