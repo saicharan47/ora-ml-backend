@@ -1,17 +1,20 @@
-
 import os
 from pathlib import Path
 
 import joblib
 import numpy as np
+import pandas as pd
 from flask import Flask, jsonify, request
+from flask_cors import CORS
 
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = Path(
-    os.getenv("ORA_MODEL_PATH", str(BASE_DIR / "ora_model.joblib"))
-)
+app = Flask(__name__)
+CORS(app)
 
-FEATURES = [
+MODEL_PATH = Path(os.getenv("ORA_MODEL_PATH", "ora_model.joblib"))
+artifact = None
+model = None
+
+DEFAULT_FEATURES = [
     "nitrogen",
     "phosphorus",
     "potassium",
@@ -22,163 +25,128 @@ FEATURES = [
     "turbidity_ntu",
 ]
 
-app = Flask(__name__)
-_model_bundle = None
+features = DEFAULT_FEATURES.copy()
+model_status = "model_not_loaded"
 
+try:
+    if MODEL_PATH.exists():
+        loaded = joblib.load(MODEL_PATH)
 
-def load_bundle():
-    global _model_bundle
-
-    if _model_bundle is None:
-        if not MODEL_PATH.is_file():
-            raise FileNotFoundError(
-                f"Model file not found: {MODEL_PATH}. "
-                "Run train_model.py first."
+        if isinstance(loaded, dict) and "model" in loaded:
+            artifact = loaded
+            model = loaded["model"]
+            features = loaded.get("features", DEFAULT_FEATURES)
+            model_status = loaded.get(
+                "model_status", "experimental_model"
             )
+        else:
+            # Backward compatibility for a legacy bare scikit-learn estimator.
+            model = loaded
+            model_status = "legacy_model_experimental"
+except Exception:
+    app.logger.exception("Failed to load ORA model")
 
-        bundle = joblib.load(MODEL_PATH)
+def get_model_classes(current_model):
+    """Return estimator class labels, including for sklearn Pipelines."""
+    if hasattr(current_model, "classes_"):
+        return list(current_model.classes_)
 
-        if not isinstance(bundle, dict) or "model" not in bundle:
-            raise ValueError(
-                "Invalid model bundle. Retrain using the supplied "
-                "train_model.py script."
-            )
+    if hasattr(current_model, "named_steps"):
+        for estimator in reversed(list(current_model.named_steps.values())):
+            if hasattr(estimator, "classes_"):
+                return list(estimator.classes_)
 
-        if "features" not in bundle:
-            raise ValueError("Model bundle does not contain feature names.")
-
-        if list(bundle["features"]) != FEATURES:
-            raise ValueError(
-                "Model feature order does not match the API feature order."
-            )
-
-        _model_bundle = bundle
-
-    return _model_bundle
-
+    return [0, 1]
 
 @app.get("/")
-def home():
+def index():
     return jsonify({
-        "service": "ORA experimental beverage sensor classifier",
+        "service": "ORA experimental prediction API",
         "status": "ok",
-        "model_file": MODEL_PATH.name,
-        "model_exists": MODEL_PATH.is_file(),
+        "model_loaded": model is not None,
+        "model_status": model_status,
         "warning": (
-            "Experimental only. The model uses simulated training data "
-            "and is not validated for real drink safety."
+            "Experimental only; not validated for drink-spiking detection. "
+            "A negative prediction does not establish that a drink is safe."
         ),
-        "predict_endpoint": "/predict",
-        "health_endpoint": "/health",
     })
-
 
 @app.get("/health")
 def health():
-    try:
-        bundle = load_bundle()
-        return jsonify({
-            "status": "ok",
-            "model_loaded": True,
-            "model_file": MODEL_PATH.name,
-            "features": bundle["features"],
-            "experimental": True,
-        })
-    except Exception as exc:
-        app.logger.exception("Health check failed")
-        return jsonify({
-            "status": "error",
-            "model_loaded": False,
-            "error": str(exc),
-        }), 503
-
+    return jsonify({
+        "status": "ok" if model is not None else "model_unavailable",
+        "model_loaded": model is not None,
+        "model_file_exists": MODEL_PATH.exists(),
+        "model_status": model_status,
+        "features": features,
+        "training_rows": artifact.get("training_rows") if artifact else None,
+        "class_counts": artifact.get("class_counts") if artifact else None,
+    }), (200 if model is not None else 503)
 
 @app.post("/predict")
 def predict():
-    try:
-        payload = request.get_json(silent=True)
+    if model is None:
+        return jsonify({
+            "error": "Model is not loaded. Train and deploy ora_model.joblib first.",
+            "model_status": model_status,
+        }), 503
 
-        if not isinstance(payload, dict):
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify({"error": "Request body must be a JSON object."}), 400
+
+    readings = body.get("readings", body)
+    if not isinstance(readings, dict):
+        return jsonify({"error": "'readings' must be a JSON object."}), 400
+
+    values = {}
+    for name in features:
+        if name not in readings or readings[name] is None:
             return jsonify({
-                "error": "Send a JSON object containing all eight sensor fields."
+                "error": f"Missing required sensor field: {name}"
             }), 400
-
-        missing = [name for name in FEATURES if name not in payload]
-        if missing:
-            return jsonify({
-                "error": "Missing required fields",
-                "missing": missing,
-            }), 400
-
-        values = {}
-
-        for name in FEATURES:
-            try:
-                value = float(payload[name])
-            except (TypeError, ValueError):
-                return jsonify({
-                    "error": f"Field '{name}' must be numeric."
-                }), 400
-
+        try:
+            value = float(readings[name])
             if not np.isfinite(value):
-                return jsonify({
-                    "error": f"Field '{name}' must be finite."
-                }), 400
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            return jsonify({
+                "error": f"Sensor field '{name}' must be a finite number."
+            }), 400
+        values[name] = value
 
-            values[name] = value
-
-        bundle = load_bundle()
-        model = bundle["model"]
-
-        # Keep the exact feature order used during training.
-        X = np.array(
-            [[values[name] for name in bundle["features"]]],
-            dtype=float,
-        )
-
+    try:
+        # Keep feature names aligned with the DataFrame used during training.
+        X = pd.DataFrame([[values[name] for name in features]], columns=features)
         prediction = int(model.predict(X)[0])
 
-        if prediction not in (0, 1):
-            raise ValueError(
-                f"Unexpected model prediction: {prediction}"
-            )
-
-        spiked_probability = None
-
+        probability = None
         if hasattr(model, "predict_proba"):
-            probabilities = model.predict_proba(X)[0]
-            classes = list(model.classes_)
-
+            probs = model.predict_proba(X)[0]
+            classes = get_model_classes(model)
             if 1 in classes:
-                spiked_probability = float(
-                    probabilities[classes.index(1)]
-                )
+                probability = float(probs[classes.index(1)])
+
+        label = "Spiked" if prediction == 1 else "Not classified as spiked"
 
         return jsonify({
             "prediction": prediction,
-            "label": "Spiked" if prediction == 1 else "Not Spiked",
-            "spiked_probability": spiked_probability,
+            "label": label,
+            "spiked_probability": probability,
             "prediction_type": "experimental_model_prediction",
-            "model_status": "experimental_simulated_training_data",
+            "model_status": model_status,
             "safety_notice": (
-                "This is an experimental model output, not a validated "
-                "drug test. The model was trained on simulated readings. "
-                "'Not Spiked' does not prove that a drink is safe. "
-                "Do not use this result to make drink-safety decisions."
+                "Experimental result only. This model is not validated to detect "
+                "drug-spiked drinks. A 'not classified as spiked' result does NOT "
+                "mean the drink is safe."
             ),
             "readings": values,
         })
-
-    except FileNotFoundError as exc:
-        return jsonify({"error": str(exc)}), 503
-
     except Exception:
         app.logger.exception("Prediction failed")
         return jsonify({
-            "error": "Prediction failed. Check server logs."
+            "error": "Prediction failed due to an internal model error."
         }), 500
 
-
 if __name__ == "__main__":
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
