@@ -1,7 +1,7 @@
-"""Train a baseline model from the ORA 24-row CSV.
-
-IMPORTANT: the CSV values are simulated and do not model tablet-dependent sensor
-changes. This script is for pipeline integration only, not validated detection.
+"""
+ORA experimental model training.
+IMPORTANT: Current dataset is tiny and contains only normal_water examples.
+This model is for pipeline/demo testing, NOT validated drink-safety detection.
 """
 import argparse
 import json
@@ -9,71 +9,104 @@ from pathlib import Path
 
 import joblib
 import pandas as pd
-from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix, classification_report
-from sklearn.model_selection import LeaveOneOut, cross_val_predict
 from sklearn.pipeline import Pipeline
+from sklearn.utils.class_weight import compute_class_weight
+import numpy as np
 
 FEATURES = [
     "nitrogen", "phosphorus", "potassium", "temperature_c",
-    "ph", "ec_us_cm", "moisture_pct", "turbidity_ntu",
+    "ph", "ec_us_cm", "moisture_pct", "turbidity_ntu"
 ]
-TARGET = "target_spiked"
-
+TARGET = "is_spiked"
+LABEL_MAP = {
+    "not_spiked": 0, "not spiked": 0, "safe": 0, "0": 0, "false": 0,
+    "spiked": 1, "1": 1, "true": 1
+}
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", default="ORA_24_sample_SIMULATED_WITH_TARGET.csv")
+    parser.add_argument("--csv", default="ora_complete_dataset.csv")
     parser.add_argument("--out", default="ora_model.joblib")
     args = parser.parse_args()
 
-    data_path = Path(args.csv)
-    if not data_path.exists():
-        raise SystemExit(f"CSV not found: {data_path}. Place the dataset beside this script or pass --csv.")
-    df = pd.read_csv(data_path)
+    csv_path = Path(args.csv)
+    if not csv_path.exists():
+        raise SystemExit(f"Dataset not found: {csv_path.resolve()}")
 
-    required = FEATURES + [TARGET]
-    missing = [c for c in required if c not in df.columns]
+    df = pd.read_csv(csv_path)
+    missing = [c for c in FEATURES + [TARGET] if c not in df.columns]
     if missing:
-        raise SystemExit(f"Dataset is missing columns: {missing}")
-    if "data_status" in df and not (df["data_status"].astype(str) == "SIMULATED_NOT_MEASURED").all():
-        print("WARNING: data_status includes values other than SIMULATED_NOT_MEASURED.")
-    if df[TARGET].isna().any() or not set(df[TARGET].astype(int).unique()).issubset({0, 1}):
-        raise SystemExit("target_spiked must contain only 0/1 values with no missing entries.")
+        raise SystemExit("Missing required columns: " + ", ".join(missing))
 
-    X = df[FEATURES].apply(pd.to_numeric, errors="coerce")
-    y = df[TARGET].astype(int)
-    if y.nunique() < 2 or y.value_counts().min() < 2:
-        raise SystemExit("Need at least two examples of each class to run this demonstration.")
+    data = df[FEATURES + [TARGET]].copy()
+    data[TARGET] = (
+        data[TARGET].astype(str).str.strip().str.lower().map(LABEL_MAP)
+    )
+    data = data.dropna(subset=[TARGET])
+    for col in FEATURES:
+        data[col] = pd.to_numeric(data[col], errors="coerce")
+    data = data.dropna(subset=FEATURES)
 
-    # Leave-one-out is descriptive only for this tiny dataset. The rows are synthetic
-    # and do not independently validate real-world generalization.
-    estimator = Pipeline([
+    if data.empty:
+        raise SystemExit("No usable rows remain after cleaning.")
+    classes = sorted(data[TARGET].astype(int).unique().tolist())
+    if classes != [0, 1]:
+        raise SystemExit(
+            "Training requires both not_spiked and spiked labels. "
+            f"Found labels: {classes}"
+        )
+
+    counts = data[TARGET].astype(int).value_counts().to_dict()
+    if min(counts.values()) < 2:
+        raise SystemExit(
+            "At least two rows per class are required even for a basic fit. "
+            f"Current counts: {counts}"
+        )
+
+    X = data[FEATURES]
+    y = data[TARGET].astype(int)
+
+    # Balanced class weights reduce the training objective's majority-class bias.
+    # With this tiny dataset, this does NOT guarantee generalization or accuracy.
+    weights = compute_class_weight(class_weight="balanced", classes=np.array([0, 1]), y=y)
+    class_weight = {0: float(weights[0]), 1: float(weights[1])}
+
+    model = Pipeline([
         ("imputer", SimpleImputer(strategy="median")),
         ("classifier", RandomForestClassifier(
-            n_estimators=200, random_state=42, class_weight="balanced"
-        )),
+            n_estimators=300,
+            max_depth=3,
+            min_samples_leaf=2,
+            class_weight=class_weight,
+            random_state=42
+        ))
     ])
-    loo = LeaveOneOut()
-    cv_pred = cross_val_predict(estimator, X, y, cv=loo)
-    print("=== Leave-one-out results (SIMULATED DATA ONLY; NOT REAL-WORLD VALIDATION) ===")
-    print(f"Rows: {len(df)}")
-    print(f"Class counts: {y.value_counts().sort_index().to_dict()} (0=NOT_SPIKED, 1=SPIKED)")
-    print(f"Accuracy: {accuracy_score(y, cv_pred):.3f}")
-    print(f"Balanced accuracy: {balanced_accuracy_score(y, cv_pred):.3f}")
-    print("Confusion matrix [rows=true 0/1, columns=predicted 0/1]:")
-    print(confusion_matrix(y, cv_pred, labels=[0, 1]))
-    print(classification_report(y, cv_pred, labels=[0, 1], target_names=["NOT_SPIKED", "SPIKED"], zero_division=0))
-    estimator.fit(X, y)
+    model.fit(X, y)
 
-    out_path = Path(args.out)
-    joblib.dump({"model": estimator, "features": FEATURES, "target": TARGET,
-                 "training_data_status": "SIMULATED_NOT_MEASURED"}, out_path)
-    print(f"Saved model bundle: {out_path.resolve()}")
-    print("WARNING: metrics and probability outputs must not be represented as validated drink-safety performance.")
-
+    artifact = {
+        "model": model,
+        "features": FEATURES,
+        "labels": {0: "Not classified as spiked", 1: "Potential contamination detected"},
+        "model_status": "experimental_tiny_manual_dataset",
+        "training_rows": int(len(data)),
+        "class_counts": {str(k): int(v) for k, v in counts.items()},
+        "training_note": (
+            "Exploratory prototype only. The dataset is small, contains only "
+            "normal_water rows, and has not been validated against independent "
+            "reference testing. Do not use as a safety guarantee."
+        )
+    }
+    joblib.dump(artifact, args.out)
+    print(json.dumps({
+        "saved_model": str(Path(args.out).resolve()),
+        "rows_used": int(len(data)),
+        "class_counts": {str(k): int(v) for k, v in counts.items()},
+        "features": FEATURES,
+        "status": artifact["model_status"],
+        "warning": artifact["training_note"]
+    }, indent=2))
 
 if __name__ == "__main__":
     main()
