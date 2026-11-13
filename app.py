@@ -1,152 +1,98 @@
 import os
-from pathlib import Path
-
 import joblib
 import numpy as np
 import pandas as pd
-from flask import Flask, jsonify, request
-from flask_cors import CORS
+from flask import Flask, request, jsonify
+from ora_stream import is_settled, WINDOW, FEATURES
 
 app = Flask(__name__)
-CORS(app)
+BUNDLE = joblib.load(os.path.join(os.path.dirname(__file__), "ora_model.joblib"))
+MODEL, MODEL_FEATURES = BUNDLE["model"], BUNDLE["features"]
+MODEL_STATUS = "experimental_manual_data_v1"
+# Extra values the app shows on screen (the model itself only uses MODEL_FEATURES)
+DISPLAY_KEYS = list(FEATURES) + ["temperature_c", "moisture_pct", "turbidity_ntu"]
 
-MODEL_PATH = Path(os.getenv("ORA_MODEL_PATH", "ora_model.joblib"))
-artifact = None
-model = None
+# "Is the pen actually in a drink?"  Your real water readings: EC 196+ and moisture ~94.
+# Anything far below that (pen in air / dry) must NOT be judged, or it would show a false green.
+# These two numbers are my estimate: put the pen in the AIR, look at what it reads, and tune them.
+MIN_EC_IN_LIQUID = 100.0
+MIN_MOISTURE_IN_LIQUID = 60.0
 
-DEFAULT_FEATURES = [
-    "nitrogen",
-    "phosphorus",
-    "potassium",
-    "temperature_c",
-    "ph",
-    "ec_us_cm",
-    "moisture_pct",
-    "turbidity_ntu",
-]
 
-features = DEFAULT_FEATURES.copy()
-model_status = "model_not_loaded"
+def in_liquid(reading):
+    if reading.get("ec_us_cm", 0.0) < MIN_EC_IN_LIQUID:
+        return False
+    if "moisture_pct" in reading and reading["moisture_pct"] < MIN_MOISTURE_IN_LIQUID:
+        return False
+    return True
 
-try:
-    if MODEL_PATH.exists():
-        loaded = joblib.load(MODEL_PATH)
 
-        if isinstance(loaded, dict) and "model" in loaded:
-            artifact = loaded
-            model = loaded["model"]
-            features = loaded.get("features", DEFAULT_FEATURES)
-            model_status = loaded.get(
-                "model_status", "experimental_model"
-            )
-        else:
-            # Backward compatibility for a legacy bare scikit-learn estimator.
-            model = loaded
-            model_status = "legacy_model_experimental"
-except Exception:
-    app.logger.exception("Failed to load ORA model")
+def run_model(reading):
+    row = pd.DataFrame([[float(reading[f]) for f in MODEL_FEATURES]], columns=MODEL_FEATURES)
+    p = round(float(MODEL.predict_proba(row)[0, 1]), 3)
+    spiked = p >= 0.5
+    return {
+        # fields the Android app reads
+        "prediction": int(spiked),
+        "label": "Spiked" if spiked else "Not Spiked",
+        "spiked_probability": p,
+        "model_status": MODEL_STATUS,
+        # kept for the earlier test scripts
+        "spiked": spiked,
+        "probability": p,
+    }
 
-def get_model_classes(current_model):
-    """Return estimator class labels, including for sklearn Pipelines."""
-    if hasattr(current_model, "classes_"):
-        return list(current_model.classes_)
 
-    if hasattr(current_model, "named_steps"):
-        for estimator in reversed(list(current_model.named_steps.values())):
-            if hasattr(estimator, "classes_"):
-                return list(estimator.classes_)
+def median_reading(window):
+    """Median of the settled window for every value the app displays."""
+    out = {}
+    for k in DISPLAY_KEYS:
+        vals = [float(s[k]) for s in window if k in s]
+        if len(vals) == len(window):
+            out[k] = float(np.median(vals))
+    return out
 
-    return [0, 1]
-
-@app.get("/")
-def index():
-    return jsonify({
-        "service": "ORA experimental prediction API",
-        "status": "ok",
-        "model_loaded": model is not None,
-        "model_status": model_status,
-        "warning": (
-            "Experimental only; not validated for drink-spiking detection. "
-            "A negative prediction does not establish that a drink is safe."
-        ),
-    })
 
 @app.get("/health")
 def health():
-    return jsonify({
-        "status": "ok" if model is not None else "model_unavailable",
-        "model_loaded": model is not None,
-        "model_file_exists": MODEL_PATH.exists(),
-        "model_status": model_status,
-        "features": features,
-        "training_rows": artifact.get("training_rows") if artifact else None,
-        "class_counts": artifact.get("class_counts") if artifact else None,
-    }), (200 if model is not None else 503)
+    return jsonify(status="ok")
+
 
 @app.post("/predict")
 def predict():
-    if model is None:
-        return jsonify({
-            "error": "Model is not loaded. Train and deploy ora_model.joblib first.",
-            "model_status": model_status,
-        }), 503
+    """One already-settled reading."""
+    data = request.get_json(silent=True) or {}
+    missing = [f for f in MODEL_FEATURES if f not in data]
+    if missing:
+        return jsonify(error=f"missing fields: {missing}"), 400
+    return jsonify(status="settled", reading={k: data[k] for k in DISPLAY_KEYS if k in data}, **run_model(data))
 
-    body = request.get_json(silent=True)
-    if not isinstance(body, dict):
-        return jsonify({"error": "Request body must be a JSON object."}), 400
 
-    readings = body.get("readings", body)
-    if not isinstance(readings, dict):
-        return jsonify({"error": "'readings' must be a JSON object."}), 400
-
-    values = {}
-    for name in features:
-        if name not in readings or readings[name] is None:
-            return jsonify({
-                "error": f"Missing required sensor field: {name}"
-            }), 400
-        try:
-            value = float(readings[name])
-            if not np.isfinite(value):
-                raise ValueError
-        except (TypeError, ValueError, OverflowError):
-            return jsonify({
-                "error": f"Sensor field '{name}' must be a finite number."
-            }), 400
-        values[name] = value
-
+@app.post("/predict_stream")
+def predict_stream():
+    """
+    App sends the recent live samples: {"samples":[{...},{...},...]}  (newest last)
+      collecting -> fewer than WINDOW samples so far
+      unstable   -> still drifting, keep sending
+      not_in_drink -> steady, but the probe isn't in liquid (no verdict)
+      settled    -> verdict + the settled (median) reading
+    """
+    data = request.get_json(silent=True) or {}
+    samples = data.get("samples", [])
+    if len(samples) < WINDOW:
+        return jsonify(status="collecting", have=len(samples), need=WINDOW)
+    window = samples[-WINDOW:]
     try:
-        # Keep feature names aligned with the DataFrame used during training.
-        X = pd.DataFrame([[values[name] for name in features]], columns=features)
-        prediction = int(model.predict(X)[0])
+        if not is_settled(window):
+            return jsonify(status="unstable")
+        reading = median_reading(window)
+        if not in_liquid(reading):
+            return jsonify(status="not_in_drink", reading=reading)
+        result = run_model(reading)
+    except (KeyError, TypeError, ValueError) as e:
+        return jsonify(error=f"bad sample: {e}"), 400
+    return jsonify(status="settled", reading=reading, **result)
 
-        probability = None
-        if hasattr(model, "predict_proba"):
-            probs = model.predict_proba(X)[0]
-            classes = get_model_classes(model)
-            if 1 in classes:
-                probability = float(probs[classes.index(1)])
-
-        label = "Spiked" if prediction == 1 else "Not classified as spiked"
-
-        return jsonify({
-            "prediction": prediction,
-            "label": label,
-            "spiked_probability": probability,
-            "prediction_type": "experimental_model_prediction",
-            "model_status": model_status,
-            "safety_notice": (
-                "Experimental result only. This model is not validated to detect "
-                "drug-spiked drinks. A 'not classified as spiked' result does NOT "
-                "mean the drink is safe."
-            ),
-            "readings": values,
-        })
-    except Exception:
-        app.logger.exception("Prediction failed")
-        return jsonify({
-            "error": "Prediction failed due to an internal model error."
-        }), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
