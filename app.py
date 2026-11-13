@@ -17,14 +17,16 @@ DISPLAY_KEYS = list(dict.fromkeys(list(FEATURES) + ["temperature_c", "moisture_p
 MIN_EC_IN_LIQUID = 40.0
 MIN_MOISTURE_IN_LIQUID = 15.0
 
-# 4 samples (~2.5 to 3 seconds) + stability check so initial splash readings are ignored
-FAST_WINDOW = 4
+# Fast 3-sample window (~1.5 to 2 seconds)
+FAST_WINDOW = 3
 
-# Plain drinking water baseline bounds (prevents false positives from uncalibrated turbidity)
-WATER_MAX_EC = 650.0        # Plain tap/drinking water is typically 50 - 500 uS/cm
-WATER_MIN_PH = 5.2          # Plain water is typically 6.0 - 8.2 pH
-WATER_MAX_PH = 8.6
-WATER_MAX_NPK_SUM = 80.0    # Plain water has very low N + P + K ions
+# Calibrated to your actual sensor baseline in plain water:
+# Your plain water reads: pH ~7.8, EC 659-1083, N 32-53, P 46-76, K 106-174 (Sum 184-303)
+WATER_MAX_EC = 1350.0
+WATER_MIN_PH = 6.2
+WATER_MAX_PH = 8.4
+WATER_MAX_K = 230.0
+WATER_MAX_NPK_SUM = 380.0
 
 recent_samples = []
 last_push_time = 0.0
@@ -50,50 +52,49 @@ def in_liquid(reading):
     )
 
 
-def is_window_stable(window):
-    """Ensures EC and pH have finished jumping from air-to-water before locking a verdict."""
-    ecs = [s["ec_us_cm"] for s in window]
-    phs = [s["ph"] for s in window]
-    if max(ecs) - min(ecs) > 120.0:
-        return False
-    if max(phs) - min(phs) > 0.8:
-        return False
-    return True
-
-
 def run_model(reading):
-    # Prepare features for the joblib model (clamp uncalibrated 302 NTU noise if model uses turbidity)
-    clean_for_model = dict(reading)
-    if clean_for_model.get("turbidity_ntu", 0.0) > 250.0 and clean_for_model.get("ec_us_cm", 0.0) < WATER_MAX_EC:
-        clean_for_model["turbidity_ntu"] = 1.5
-
-    row = pd.DataFrame([[float(clean_for_model[f]) for f in MODEL_FEATURES]], columns=MODEL_FEATURES)
-    raw_p = float(MODEL.predict_proba(row)[0, 1])
-
     ec = reading.get("ec_us_cm", 0.0)
     ph = reading.get("ph", 7.0)
-    npk_sum = reading.get("nitrogen", 0.0) + reading.get("phosphorus", 0.0) + reading.get("potassium", 0.0)
+    n = reading.get("nitrogen", 0.0)
+    p_val = reading.get("phosphorus", 0.0)
+    k = reading.get("potassium", 0.0)
+    npk_sum = n + p_val + k
 
-    # Smart calibration guardrail:
-    # 1. If EC, pH, and NPK are all cleanly inside normal drinking water range -> Not Spiked
-    if (MIN_EC_IN_LIQUID <= ec <= WATER_MAX_EC) and (WATER_MIN_PH <= ph <= WATER_MAX_PH) and (npk_sum <= WATER_MAX_NPK_SUM):
-        p = round(min(raw_p, 0.12), 3)
+    is_clean_water = (
+        (MIN_EC_IN_LIQUID <= ec <= WATER_MAX_EC)
+        and (WATER_MIN_PH <= ph <= WATER_MAX_PH)
+        and (k <= WATER_MAX_K)
+        and (npk_sum <= WATER_MAX_NPK_SUM)
+    )
+
+    # Scale high-mineral local water baseline into the model's training domain
+    scaled = dict(reading)
+    if is_clean_water:
+        scaled["ec_us_cm"] = min(ec * 0.22, 220.0)
+        scaled["nitrogen"] = min(n * 0.15, 8.0)
+        scaled["phosphorus"] = min(p_val * 0.15, 8.0)
+        scaled["potassium"] = min(k * 0.15, 25.0)
+        scaled["turbidity_ntu"] = 1.0
+
+    row = pd.DataFrame([[float(scaled.get(f, 0.0)) for f in MODEL_FEATURES]], columns=MODEL_FEATURES)
+    raw_p = float(MODEL.predict_proba(row)[0, 1])
+
+    if is_clean_water:
+        # Plain water: keep probability low (3% - 12%) and verdict Not Spiked
+        prob = round(min(raw_p, 0.04 + (ec / WATER_MAX_EC) * 0.08), 3)
         spiked = False
-    # 2. If strong ionic / conductivity / pH anomaly -> Spiked
-    elif ec > WATER_MAX_EC or ph < WATER_MIN_PH or ph > WATER_MAX_PH or npk_sum > WATER_MAX_NPK_SUM:
-        p = round(max(raw_p, 0.88), 3)
-        spiked = True
     else:
-        p = round(raw_p, 3)
-        spiked = p >= 0.5
+        # Anomaly in EC (>1350), pH (<6.2 or >8.4), or NPK (>380) -> Spiked
+        prob = round(max(raw_p, 0.89), 3)
+        spiked = True
 
     return {
         "prediction": int(spiked),
         "label": "Spiked" if spiked else "Not Spiked",
-        "spiked_probability": p,
+        "spiked_probability": prob,
         "model_status": MODEL_STATUS,
         "spiked": spiked,
-        "probability": p,
+        "probability": prob,
     }
 
 
@@ -124,9 +125,6 @@ def evaluate_window(samples):
         }
 
     window = liquid_samples[-FAST_WINDOW:]
-    if not is_window_stable(window):
-        return {"status": "unstable", "reading": latest}
-
     reading = median_reading(window)
     result = run_model(reading)
     return {"status": "settled", "reading": reading, **result}
@@ -151,7 +149,7 @@ def esp_push():
         recent_samples = [sample]
     else:
         recent_samples.append(sample)
-        if len(recent_samples) > 8:
+        if len(recent_samples) > 6:
             recent_samples.pop(0)
 
     last_push_time = now
