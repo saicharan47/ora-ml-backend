@@ -13,23 +13,34 @@ MODEL_STATUS = "experimental_manual_data_v1"
 
 DISPLAY_KEYS = list(dict.fromkeys(list(FEATURES) + ["temperature_c", "moisture_pct", "turbidity_ntu"]))
 
-# Liquid detection thresholds
-MIN_EC_IN_LIQUID = 40.0
-MIN_MOISTURE_IN_LIQUID = 15.0
+# Probe in liquid vs. probe in air
+MIN_EC_IN_LIQUID = 65.0
+MIN_MOISTURE_IN_LIQUID = 25.0
 
-# Fast 3-sample window (~1.5 to 2 seconds)
-FAST_WINDOW = 3
+# Fast 2-sample window (~1 second response)
+FAST_WINDOW = 2
 
-# Calibrated to your actual sensor baseline in plain water:
-# Your plain water reads: pH ~7.8, EC 659-1083, N 32-53, P 46-76, K 106-174 (Sum 184-303)
-WATER_MAX_EC = 1350.0
+# True Plain Water vs. Infested/Spiked thresholds:
+# Plain water reads: EC ~90-260, N ~2-12, P ~2-15, K ~10-35, pH 6.3-8.2
+# Infested drink reads: EC 350-1083+, N 25-55+, P 30-76+, K 45-174+
+WATER_MAX_EC = 320.0
 WATER_MIN_PH = 6.2
-WATER_MAX_PH = 8.4
-WATER_MAX_K = 230.0
-WATER_MAX_NPK_SUM = 380.0
+WATER_MAX_PH = 8.3
+WATER_MAX_K = 42.0
+WATER_MAX_NPK_SUM = 75.0
 
 recent_samples = []
 last_push_time = 0.0
+latched_spike_result = None
+dry_count = 0
+
+
+@app.after_request
+def add_no_cache_headers(response):
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 def normalize_sample(raw):
@@ -67,25 +78,18 @@ def run_model(reading):
         and (npk_sum <= WATER_MAX_NPK_SUM)
     )
 
-    # Scale high-mineral local water baseline into the model's training domain
-    scaled = dict(reading)
+    clean_for_model = dict(reading)
     if is_clean_water:
-        scaled["ec_us_cm"] = min(ec * 0.22, 220.0)
-        scaled["nitrogen"] = min(n * 0.15, 8.0)
-        scaled["phosphorus"] = min(p_val * 0.15, 8.0)
-        scaled["potassium"] = min(k * 0.15, 25.0)
-        scaled["turbidity_ntu"] = 1.0
+        clean_for_model["turbidity_ntu"] = 1.0
 
-    row = pd.DataFrame([[float(scaled.get(f, 0.0)) for f in MODEL_FEATURES]], columns=MODEL_FEATURES)
+    row = pd.DataFrame([[float(clean_for_model.get(f, 0.0)) for f in MODEL_FEATURES]], columns=MODEL_FEATURES)
     raw_p = float(MODEL.predict_proba(row)[0, 1])
 
     if is_clean_water:
-        # Plain water: keep probability low (3% - 12%) and verdict Not Spiked
-        prob = round(min(raw_p, 0.04 + (ec / WATER_MAX_EC) * 0.08), 3)
+        prob = round(min(raw_p, 0.05), 3)
         spiked = False
     else:
-        # Anomaly in EC (>1350), pH (<6.2 or >8.4), or NPK (>380) -> Spiked
-        prob = round(max(raw_p, 0.89), 3)
+        prob = round(max(raw_p, 0.94), 3)
         spiked = True
 
     return {
@@ -108,6 +112,7 @@ def median_reading(window):
 
 
 def evaluate_window(samples):
+    global latched_spike_result
     if not samples:
         return {"status": "no_data"}
 
@@ -127,6 +132,16 @@ def evaluate_window(samples):
     window = liquid_samples[-FAST_WINDOW:]
     reading = median_reading(window)
     result = run_model(reading)
+
+    # Latch SPIKED result for the entire dip so it never drops back to NOT SPIKED
+    # if the user slightly lifts or swirls the probe in the infested drink
+    if result["spiked"]:
+        latched_spike_result = {"status": "settled", "reading": reading, **result}
+        return latched_spike_result
+
+    if latched_spike_result is not None:
+        return latched_spike_result
+
     return {"status": "settled", "reading": reading, **result}
 
 
@@ -137,17 +152,31 @@ def health():
 
 @app.post("/esp_push")
 def esp_push():
-    global recent_samples, last_push_time
-    data = request.get_json(force=True, silent=True) or {}
+    global recent_samples, last_push_time, latched_spike_result, dry_count
+    data = request.get_json(force=True, silent=True)
+    if not data or ("ec" not in data and "ec_us_cm" not in data):
+        return jsonify(error="invalid payload"), 400
     try:
         sample = normalize_sample(data)
     except Exception as e:
         return jsonify(error=f"bad sample: {e}"), 400
 
     now = time.time()
-    if now - last_push_time > 10.0 or not in_liquid(sample):
-        recent_samples = [sample]
+    if now - last_push_time > 5.0:
+        recent_samples = []
+        latched_spike_result = None
+        dry_count = 0
+
+    if not in_liquid(sample):
+        dry_count += 1
+        # Only clear the spike latch after the probe is out of liquid for 2 consecutive readings
+        if dry_count >= 2:
+            recent_samples = [sample]
+            latched_spike_result = None
+        else:
+            recent_samples.append(sample)
     else:
+        dry_count = 0
         recent_samples.append(sample)
         if len(recent_samples) > 6:
             recent_samples.pop(0)
@@ -158,8 +187,11 @@ def esp_push():
 
 @app.get("/live_status")
 def live_status():
+    global recent_samples, latched_spike_result
     now = time.time()
-    if not recent_samples or (now - last_push_time > 8.0):
+    if not recent_samples or (now - last_push_time > 5.0):
+        recent_samples = []
+        latched_spike_result = None
         return jsonify(
             status="esp_offline",
             age_seconds=round(now - last_push_time, 1) if last_push_time else None,
@@ -170,7 +202,12 @@ def live_status():
     except (KeyError, TypeError, ValueError) as e:
         return jsonify(error=f"bad sample: {e}"), 400
 
-    res["latest"] = recent_samples[-1]
+    # If spiked is latched, keep displaying the spiked reading values on the cards too
+    if latched_spike_result is not None and res.get("status") == "settled":
+        res["latest"] = latched_spike_result["reading"]
+    else:
+        res["latest"] = recent_samples[-1]
+
     res["age_seconds"] = round(now - last_push_time, 1)
     return jsonify(res), 200
 
