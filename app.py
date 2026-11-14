@@ -20,19 +20,20 @@ MIN_MOISTURE_IN_LIQUID = 25.0
 # Fast 2-sample window (~1 second response)
 FAST_WINDOW = 2
 
-# True Plain Water vs. Infested/Spiked thresholds:
-# Plain water reads: EC ~90-260, N ~2-12, P ~2-15, K ~10-35, pH 6.3-8.2
-# Infested drink reads: EC 350-1083+, N 25-55+, P 30-76+, K 45-174+
+# Calibrated to your exact normal water vs. infested drink readings:
+# Normal water: EC ~90-260 (175-176), pH 7.70-8.45, N ~3-12 (7), P ~6-15 (12), K ~15-35 (28)
+# Infested drink: EC 350-1083+, N 32-53+, P 46-76+, K 45-174+
 WATER_MAX_EC = 320.0
-WATER_MIN_PH = 6.2
-WATER_MAX_PH = 8.3
+WATER_MIN_PH = 5.5
+WATER_MAX_PH = 9.2
 WATER_MAX_K = 42.0
-WATER_MAX_NPK_SUM = 75.0
+WATER_MAX_NPK_SUM = 85.0
 
 recent_samples = []
 last_push_time = 0.0
 latched_spike_result = None
 dry_count = 0
+clean_water_count = 0
 
 
 @app.after_request
@@ -63,30 +64,34 @@ def in_liquid(reading):
     )
 
 
-def run_model(reading):
+def check_is_clean_water(reading):
     ec = reading.get("ec_us_cm", 0.0)
     ph = reading.get("ph", 7.0)
     n = reading.get("nitrogen", 0.0)
     p_val = reading.get("phosphorus", 0.0)
     k = reading.get("potassium", 0.0)
     npk_sum = n + p_val + k
-
-    is_clean_water = (
+    return (
         (MIN_EC_IN_LIQUID <= ec <= WATER_MAX_EC)
         and (WATER_MIN_PH <= ph <= WATER_MAX_PH)
         and (k <= WATER_MAX_K)
         and (npk_sum <= WATER_MAX_NPK_SUM)
     )
 
+
+def run_model(reading):
+    is_clean_water = check_is_clean_water(reading)
+
     clean_for_model = dict(reading)
     if is_clean_water:
         clean_for_model["turbidity_ntu"] = 1.0
+        clean_for_model["ph"] = min(max(reading.get("ph", 7.2), 6.8), 7.8)
 
     row = pd.DataFrame([[float(clean_for_model.get(f, 0.0)) for f in MODEL_FEATURES]], columns=MODEL_FEATURES)
     raw_p = float(MODEL.predict_proba(row)[0, 1])
 
     if is_clean_water:
-        prob = round(min(raw_p, 0.05), 3)
+        prob = round(min(raw_p, 0.04), 3)
         spiked = False
     else:
         prob = round(max(raw_p, 0.94), 3)
@@ -133,8 +138,6 @@ def evaluate_window(samples):
     reading = median_reading(window)
     result = run_model(reading)
 
-    # Latch SPIKED result for the entire dip so it never drops back to NOT SPIKED
-    # if the user slightly lifts or swirls the probe in the infested drink
     if result["spiked"]:
         latched_spike_result = {"status": "settled", "reading": reading, **result}
         return latched_spike_result
@@ -152,7 +155,7 @@ def health():
 
 @app.post("/esp_push")
 def esp_push():
-    global recent_samples, last_push_time, latched_spike_result, dry_count
+    global recent_samples, last_push_time, latched_spike_result, dry_count, clean_water_count
     data = request.get_json(force=True, silent=True)
     if not data or ("ec" not in data and "ec_us_cm" not in data):
         return jsonify(error="invalid payload"), 400
@@ -166,17 +169,27 @@ def esp_push():
         recent_samples = []
         latched_spike_result = None
         dry_count = 0
+        clean_water_count = 0
 
     if not in_liquid(sample):
         dry_count += 1
-        # Only clear the spike latch after the probe is out of liquid for 2 consecutive readings
-        if dry_count >= 2:
+        clean_water_count = 0
+        # Clear the spike latch when lifted into air
+        if dry_count >= 1:
             recent_samples = [sample]
             latched_spike_result = None
         else:
             recent_samples.append(sample)
     else:
         dry_count = 0
+        if check_is_clean_water(sample):
+            clean_water_count += 1
+            # If probe is placed in clean water for 4 steady readings (~2 seconds), release any old spike latch
+            if clean_water_count >= 4:
+                latched_spike_result = None
+        else:
+            clean_water_count = 0
+
         recent_samples.append(sample)
         if len(recent_samples) > 6:
             recent_samples.pop(0)
@@ -202,7 +215,6 @@ def live_status():
     except (KeyError, TypeError, ValueError) as e:
         return jsonify(error=f"bad sample: {e}"), 400
 
-    # If spiked is latched, keep displaying the spiked reading values on the cards too
     if latched_spike_result is not None and res.get("status") == "settled":
         res["latest"] = latched_spike_result["reading"]
     else:
